@@ -158,6 +158,11 @@ ST_DATA const int reg_classes[NB_REGS] = {
 static unsigned long func_sub_sp_offset;
 static int func_ret_sub;
 
+/* enum calling convention per-function state (SysV path) */
+static int                func_enum_callconv;
+static struct EnumCCFunc *func_enum_cc;
+static Sym               *mem_corruption_sym;
+
 #if defined(CONFIG_TCC_BCHECK)
 static addr_t func_bound_offset;
 static unsigned long func_bound_ind;
@@ -1430,7 +1435,53 @@ void gfunc_call(int nb_args)
 
     if (vtop->type.ref->f.func_type != FUNC_NEW) /* implies FUNC_OLD or FUNC_ELLIPSIS */
         oad(0xb8, nb_sse_args < 8 ? nb_sse_args : 8); /* mov nb_sse_args, %eax */
-    gcall_or_jmp(0);
+
+    {
+        Sym *callee_sym = (vtop->r & VT_SYM) ? vtop->sym : NULL;
+        int callee_ec = callee_sym
+                     && callee_sym->type.ref
+                     && callee_sym->type.ref->f.enum_callconv;
+
+        if (callee_ec) {
+            int ei;
+            struct EnumCCFunc *ecf = NULL;
+            for (ei = 0; ei < tcc_state->nb_enum_cc_funcs; ei++) {
+                if (tcc_state->enum_cc_funcs[ei]->fn_sym == callee_sym) {
+                    ecf = tcc_state->enum_cc_funcs[ei];
+                    break;
+                }
+            }
+            if (!ecf)
+                tcc_error("enum_callconv: '%s' must be defined before its callers",
+                          get_tok_str(callee_sym->v, NULL));
+
+            /* pushq $N = 68 [imm32] */
+            g(0x68); gen_le32(ecf->nb_callsites);
+            /* jmp fn */
+            gcall_or_jmp(1);
+            /* record after_call_N offset (before any landing-pad reload) */
+            {
+                unsigned long after_call = ind;
+                /* if caller is enum_callconv, %r12 may have been clobbered;
+                 * reload it from its save slot */
+                if (func_enum_callconv) {
+                    /* movq -8(%rbp),%r12 = 4C 8B 65 F8 */
+                    g(0x4C); g(0x8B); g(0x65); g(0xF8);
+                }
+                /* grow callsite array */
+                if (ecf->nb_callsites >= ecf->cap_callsites) {
+                    ecf->cap_callsites = ecf->cap_callsites ? ecf->cap_callsites * 2 : 4;
+                    ecf->callsites = tcc_realloc(ecf->callsites,
+                        (unsigned)ecf->cap_callsites * sizeof(*ecf->callsites));
+                }
+                ecf->callsites[ecf->nb_callsites].after_call_offset = after_call;
+                ecf->nb_callsites++;
+            }
+        } else {
+            gcall_or_jmp(0);
+        }
+    }
+
     if (args_size)
         gadd_sp(args_size);
     vtop--;
@@ -1441,6 +1492,14 @@ void gfunc_call(int nb_args)
 static void push_arg_reg(int i) {
     loc -= 8;
     gen_modrm64(0x89, arg_regs[i], VT_LOCAL, NULL, loc);
+}
+
+/* lazily resolve __stack_chk_fail once; used as jae target for bounds failures */
+static void init_mem_corruption_sym(void)
+{
+    if (!mem_corruption_sym)
+        mem_corruption_sym = external_helper_sym(
+            tok_alloc_const("__stack_chk_fail"));
 }
 
 /* generate function prolog of type 't' */
@@ -1454,12 +1513,43 @@ void gfunc_prolog(Sym *func_sym)
     CType *type;
 
     sym = func_type->ref;
-    addr = PTR_SIZE * 2;
     loc = 0;
+    func_ret_sub = 0;
+
+    {
+        int is_enum_cc = func_sym->type.ref->f.enum_callconv;
+        func_enum_callconv = is_enum_cc;
+        func_enum_cc = NULL;
+
+        if (is_enum_cc && funcname && strcmp(funcname, "main") == 0)
+            tcc_error("main() cannot use enum_callconv");
+        if (is_enum_cc && func_var)
+            tcc_error("variadic functions cannot use enum_callconv");
+
+        if (is_enum_cc) {
+            struct EnumCCFunc *ecf = tcc_mallocz(sizeof(*ecf));
+            init_mem_corruption_sym();
+            /* popq %r12: REX.B(0x41) + POP(0x58 + 4) = 0x41 0x5C */
+            g(0x41); g(0x5C);
+            addr = PTR_SIZE; /* no return address; first stack arg at rbp+8 */
+            ecf->fn_sym = func_sym;
+            dynarray_add(&tcc_state->enum_cc_funcs,
+                         &tcc_state->nb_enum_cc_funcs, ecf);
+            func_enum_cc = ecf;
+        } else {
+            addr = PTR_SIZE * 2;
+        }
+    }
+
     ind += FUNC_PROLOG_SIZE;
     func_sub_sp_offset = ind;
-    func_ret_sub = 0;
     ret_mode = classify_x86_64_arg(&func_vt, NULL, &size, &align, &reg_count);
+
+    if (func_enum_callconv) {
+        /* save %r12 (ENUM) at -8(%rbp): movq %r12,-8(%rbp) = 4C 89 65 F8 */
+        g(0x4C); g(0x89); g(0x65); g(0xF8);
+        loc = -8; /* reserve -8(%rbp) for ENUM; locals start at -16 */
+    }
 
     if (func_var) {
         int seen_reg_num, seen_sse_num, seen_stack_size;
@@ -1605,13 +1695,40 @@ void gfunc_epilog(void)
     if (tcc_state->do_bounds_check)
         gen_bounds_epilog();
 #endif
-    o(0xc9); /* leave */
-    if (func_ret_sub == 0) {
-        o(0xc3); /* ret */
+    if (func_enum_callconv) {
+        /* reload ENUM: movq -8(%rbp),%r12 = 4C 8B 65 F8 */
+        g(0x4C); g(0x8B); g(0x65); g(0xF8);
+        /* manual leave: movq %rbp,%rsp = 48 89 EC */
+        g(0x48); g(0x89); g(0xEC);
+        /* popq %rbp = 5D */
+        g(0x5D);
+        /* cmpq $MAX,%r12 = 49 81 FC [imm32]; record offset for finalization */
+        g(0x49); g(0x81); g(0xFC);
+        func_enum_cc->cmpq_imm_offset = ind;
+        gen_le32(0); /* patched by enum_cc_finalize */
+        /* jae __stack_chk_fail@PLT = 0F 83 [rel32] (PLT32 so linker creates stub) */
+        g(0x0F); g(0x83);
+        greloca(cur_text_section, mem_corruption_sym, ind, R_X86_64_PLT32, -4);
+        gen_le32(0);
+        /* leaq fn_jmptbl(%rip),%r11 = 4C 8D 1D [rel32]; record offset for finalization */
+        g(0x4C); g(0x8D); g(0x1D);
+        func_enum_cc->leaq_rel32_offset = ind;
+        gen_le32(0); /* patched by enum_cc_finalize */
+        /* movq (%r11,%r12,8),%r10 = 4F 8B 14 E3 */
+        g(0x4F); g(0x8B); g(0x14); g(0xE3);
+        /* addq %r10,%r11 = 4D 01 D3 */
+        g(0x4D); g(0x01); g(0xD3);
+        /* jmpq *%r11 = 41 FF E3 */
+        g(0x41); g(0xFF); g(0xE3);
     } else {
-        o(0xc2); /* ret n */
-        g(func_ret_sub);
-        g(func_ret_sub >> 8);
+        o(0xc9); /* leave */
+        if (func_ret_sub == 0) {
+            o(0xc3); /* ret */
+        } else {
+            o(0xc2); /* ret n */
+            g(func_ret_sub);
+            g(func_ret_sub >> 8);
+        }
     }
     /* align local size to word & save local variables */
     v = (-loc + 15) & -16;

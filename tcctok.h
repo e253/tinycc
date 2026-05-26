@@ -148,6 +148,8 @@
      DEF(TOK_NOINLINE, "__noinline__")
      DEF(TOK_PURE1, "pure")
      DEF(TOK_PURE2, "__pure__")
+     DEF(TOK_ENUM_CC1, "enum_callconv")
+     DEF(TOK_ENUM_CC2, "__enum_callconv__")
 
      DEF(TOK_MODE, "__mode__")
      DEF(TOK_MODE_QI, "__QI__")

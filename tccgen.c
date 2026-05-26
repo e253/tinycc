@@ -402,6 +402,46 @@ ST_FUNC void tccgen_init(TCCState *s1)
     cstr_new(&initstr);
 }
 
+/* Phase 1: allocate jump tables in rodata_section BEFORE collect_sections/section layout.
+ * Must be called before the linker computes section sizes and virtual addresses. */
+ST_FUNC void enum_cc_alloc_tables(TCCState *s1, Section *rdatasec)
+{
+    int i;
+    for (i = 0; i < s1->nb_enum_cc_funcs; i++) {
+        struct EnumCCFunc *ecf = s1->enum_cc_funcs[i];
+        ecf->jmptable_offset = section_add(rdatasec,
+                                           (addr_t)ecf->nb_callsites * 8, 8);
+    }
+}
+
+/* Phase 2: patch cmpq/leaq/table entries AFTER section virtual addresses are known.
+ * Must be called after collect_sections and relocate_syms. */
+ST_FUNC void enum_cc_finalize(TCCState *s1, Section *textsec, Section *rdatasec)
+{
+    int i, n;
+    for (i = 0; i < s1->nb_enum_cc_funcs; i++) {
+        struct EnumCCFunc *ecf = s1->enum_cc_funcs[i];
+        int max = ecf->nb_callsites;
+        addr_t leaq_end, table_va;
+
+        /* patch leaq rel32: table_va - leaq_insn_end_va */
+        leaq_end = textsec->sh_addr + ecf->leaq_rel32_offset + 4;
+        table_va = rdatasec->sh_addr + ecf->jmptable_offset;
+        write32le(textsec->data + ecf->leaq_rel32_offset,
+                  (uint32_t)(int32_t)(table_va - leaq_end));
+
+        /* patch cmpq $MAX */
+        write32le(textsec->data + ecf->cmpq_imm_offset, (uint32_t)max);
+
+        /* fill jump table: entry[n] = callsite_va - table_va */
+        for (n = 0; n < max; n++) {
+            addr_t cs_va = textsec->sh_addr + ecf->callsites[n].after_call_offset;
+            write64le(rdatasec->data + ecf->jmptable_offset + (addr_t)n * 8,
+                      (uint64_t)(int64_t)(cs_va - table_va));
+        }
+    }
+}
+
 ST_FUNC int tccgen_compile(TCCState *s1)
 {
     funcname = "";
@@ -1209,6 +1249,8 @@ static void merge_funcattr(struct FuncAttr *fa, struct FuncAttr *fa1)
       fa->func_ctor = 1;
     if (fa1->func_dtor)
       fa->func_dtor = 1;
+    if (fa1->enum_callconv)
+      fa->enum_callconv = 1;
 }
 
 /* Merge attributes.  */
@@ -4039,6 +4081,10 @@ redo:
         case TOK_FORMAT2:
 	    /* ignored */
             goto skip_param;
+        case TOK_ENUM_CC1:
+        case TOK_ENUM_CC2:
+            ad->f.enum_callconv = 1;
+            break;
         case TOK_NORETURN1:
         case TOK_NORETURN2:
             ad->f.func_noreturn = 1;

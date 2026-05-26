@@ -17,6 +17,9 @@
  */
 #include "tcc.h"
 
+ST_FUNC void enum_cc_alloc_tables(TCCState *s1, Section *rdatasec);
+ST_FUNC void enum_cc_finalize(TCCState *s1, Section *textsec, Section *rdatasec);
+
 /* In order to make life easy for us we are generating Mach-O files which
    don't make use of some modern features, but which aren't entirely classic
    either in that they do use some modern features.  We're also only
@@ -2204,8 +2207,10 @@ ST_FUNC int macho_output_file(TCCState *s1, const char *filename)
     if (!ret) {
 	int save_output = s1->output_type;
 
+        enum_cc_alloc_tables(s1, rodata_section);
         collect_sections(s1, &mo, filename);
         relocate_syms(s1, s1->symtab, 0);
+        enum_cc_finalize(s1, text_section, rodata_section);
 	if (s1->output_type == TCC_OUTPUT_EXE)
             mo.ep->entryoff = get_sym_addr(s1, "main", 1, 1)
                             -     get_segment(&mo, 1)->vmaddr;

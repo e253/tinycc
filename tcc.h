@@ -524,8 +524,9 @@ struct FuncAttr {
     func_ctor   : 1, /* attribute((constructor)) */
     func_dtor   : 1, /* attribute((destructor)) */
     func_args   : 8, /* PE __stdcall args */
-    func_alwinl : 1, /* always_inline */
-    xxxx        : 15;
+    func_alwinl   : 1, /* always_inline */
+    enum_callconv : 1, /* enumerated calling convention */
+    xxxx          : 14;
 };
 
 /* symbol management */
@@ -564,6 +565,22 @@ typedef struct Sym {
         struct Sym *cleanup_label; /* label in 'pending_gotos' chain */
     };
 } Sym;
+
+/* enum calling convention — one call site recorded during gfunc_call */
+struct EnumCCCallSite {
+    unsigned long after_call_offset; /* text_section offset of the "after_call_N" label */
+};
+
+/* per-callee state created at gfunc_prolog for enum_callconv functions */
+struct EnumCCFunc {
+    Sym               *fn_sym;
+    unsigned long      cmpq_imm_offset;   /* offset of 4-byte imm in: cmpq $MAX,%r12 */
+    unsigned long      leaq_rel32_offset; /* offset of 4-byte rel32 in: leaq tbl(%rip),%r11 */
+    unsigned long      jmptable_offset;   /* offset in rodata_section; set at finalization */
+    struct EnumCCCallSite *callsites;
+    int                nb_callsites;
+    int                cap_callsites;
+};
 
 /* section definition */
 typedef struct Section {
@@ -916,6 +933,9 @@ struct TCCState {
     Section *eh_frame_section;
     Section *eh_frame_hdr_section;
     unsigned long eh_start;
+    /* enum calling convention */
+    struct EnumCCFunc **enum_cc_funcs;
+    int                nb_enum_cc_funcs;
     /* debug sections */
     Section *stab_section;
     Section *dwarf_info_section;
