@@ -1,6 +1,6 @@
 # Enumerated Calling Convention — Implementation Progress
 
-## Status: In progress — x86_64 linker fixed, final run test pending
+## Status: COMPLETE — all tests pass
 
 ---
 
@@ -51,20 +51,7 @@ Call sites in `tccmacho.c` (no `USING_GLOBALS`) pass `rodata_section` → `s1->r
 | x86_64 object file generation (`x86_64-osx-tcc -c`) | Pass |
 | x86_64 disassembly check (objdump confirms pushq/jmp at call sites, return sequence in epilog) | Pass |
 | x86_64 link — 1-function test `add` only | Pass (link exit 0, run exit 0 via Rosetta 2) |
-| x86_64 link — full standalone test (add + mul + compute) | **Pending** |
-
----
-
-## Next step
-
-Run the full standalone test:
-```sh
-SDK=$(xcrun --show-sdk-path)
-./x86_64-osx-tcc -B. -I"$SDK/usr/include" -L"$SDK/usr/lib" -lSystem \
-    -o /tmp/test_enum_cc_x86 test_enum_cc_standalone.c
-arch -x86_64 /tmp/test_enum_cc_x86
-echo "exit: $?"
-```
-Expected: exit 0.
-
-Then verify with `otool -tv` that no `call`/`ret` appear in enum_callconv functions, and that the jump table lands in `__TEXT,__rodata`.
+| x86_64 link — full standalone test (add + mul + compute) | Pass (exit 0 via Rosetta 2) |
+| No `call`/`ret` in enum_callconv functions (`otool -tv`) | Pass — 0 occurrences |
+| Jump table in `__DATA_CONST,__rodata` | Pass — 5 entries across 3 functions |
+| Normal (non-enum_callconv) functions unaffected | Pass — still uses `callq`/`retq` |
